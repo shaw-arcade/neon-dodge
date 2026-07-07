@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Neon Dodge</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #05050f;
+    overflow: hidden;
+    height: 100%;
+    font-family: "Courier New", monospace;
+  }
+  #game {
+    display: block;
+    margin: 0 auto;
+    background: #05050f;
+    touch-action: none;
+  }
+  body { overscroll-behavior: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  let W = window.innerWidth;
+  let H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+  window.addEventListener('resize', () => {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+  });
+
+  const NEON = ['#00f7ff', '#ff2fd6', '#a6ff00', '#ffb300', '#7b5cff', '#ff3355'];
+  const PLAYER_COLOR = '#00f7ff';
+  const SHIELD_COLOR = '#7b5cff';
+
+  const SHIELD_DURATION = 5000;   // 5 seconds
+  const SHIELD_MAX_USES = 2;      // 2 uses per run
+
+  let state = 'start';            // start | playing | gameover
+  let keys = {};
+  let player, obstacles, particles, stars;
+  let score, bestScore, dodged, speedMult, spawnTimer, spawnInterval;
+  let shieldUses, shieldActiveUntil;
+  let lastTime = 0, elapsed = 0;
+
+  // localStorage can throw in sandboxed viewers; never let that kill the game
+  function loadBest() {
+    try { return Number(localStorage.getItem('neonDodgeBest') || 0); }
+    catch (e) { return 0; }
+  }
+  function saveBest(v) {
+    try { localStorage.setItem('neonDodgeBest', v); } catch (e) {}
+  }
+  bestScore = loadBest();
+
+  function makeStars() {
+    stars = [];
+    for (let i = 0; i < 90; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.5 + 0.3,
+        tw: Math.random() * Math.PI * 2
+      });
+    }
+  }
+  makeStars();
+
+  function reset() {
+    player = { x: W / 2, y: H / 2, r: 12, speed: 340, angle: 0 };
+    obstacles = [];
+    particles = [];
+    score = 0;
+    dodged = 0;
+    speedMult = 1;
+    spawnInterval = 900;
+    spawnTimer = 0;
+    shieldUses = SHIELD_MAX_USES;
+    shieldActiveUntil = 0;
+    elapsed = 0;
+  }
+
+  function shieldOn() {
+    return performance.now() < shieldActiveUntil;
+  }
+
+  function spawnObstacle() {
+    const edge = Math.floor(Math.random() * 4); // 0 top, 1 right, 2 bottom, 3 left
+    const size = 10 + Math.random() * 18;
+    let x, y;
+    if (edge === 0) { x = Math.random() * W; y = -size * 2; }
+    else if (edge === 1) { x = W + size * 2; y = Math.random() * H; }
+    else if (edge === 2) { x = Math.random() * W; y = H + size * 2; }
+    else { x = -size * 2; y = Math.random() * H; }
+
+    // Aim near the player with some scatter so paths vary
+    const tx = player.x + (Math.random() - 0.5) * W * 0.5;
+    const ty = player.y + (Math.random() - 0.5) * H * 0.5;
+    const dx = tx - x, dy = ty - y;
+    const len = Math.hypot(dx, dy) || 1;
+    const baseSpeed = (120 + Math.random() * 90) * speedMult;
+
+    obstacles.push({
+      x, y,
+      vx: dx / len * baseSpeed,
+      vy: dy / len * baseSpeed,
+      r: size,
+      sides: 3 + Math.floor(Math.random() * 4), // 3 to 6 sided shapes
+      rot: Math.random() * Math.PI * 2,
+      rotSpeed: (Math.random() - 0.5) * 4,
+      color: NEON[Math.floor(Math.random() * NEON.length)],
+      entered: false
+    });
+  }
+
+  function burst(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 60 + Math.random() * 240;
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        life: 0.6 + Math.random() * 0.5,
+        maxLife: 1,
+        color
+      });
+    }
+  }
+
+  function gameOver() {
+    state = 'gameover';
+    burst(player.x, player.y, PLAYER_COLOR, 60);
+    if (score > bestScore) {
+      bestScore = score;
+      saveBest(bestScore);
+    }
+  }
+
+  // ---------- input ----------
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Spacebar'].includes(e.key)) {
+      e.preventDefault();
+    }
+    keys[e.key] = true;
+
+    if (state === 'start' && (e.key.startsWith('Arrow') || e.key === ' ')) {
+      reset();
+      state = 'playing';
+      return;
+    }
+    if (state === 'gameover' && (e.key === 'Enter' || e.key === ' ')) {
+      reset();
+      state = 'playing';
+      return;
+    }
+    if (state === 'playing' && (e.key === ' ' || e.key === 'Spacebar')) {
+      tryShield();
+    }
+  });
+  window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+
+  // Clicking always gives the game keyboard focus, and can start or restart it.
+  canvas.tabIndex = 0;
+  function tryShield() {
+    if (state === 'playing' && !shieldOn() && shieldUses > 0) {
+      shieldUses--;
+      shieldActiveUntil = performance.now() + SHIELD_DURATION;
+      burst(player.x, player.y, SHIELD_COLOR, 24);
+    }
+  }
+
+  function clickToStart() {
+    canvas.focus();
+    window.focus();
+    if (state === 'start' || state === 'gameover') {
+      reset();
+      state = 'playing';
+    }
+  }
+  canvas.addEventListener('click', () => { if (state !== 'playing') clickToStart(); });
+
+  // ---------- touch controls (iPad / phone) ----------
+  const isTouch = ('ontouchstart' in window) || matchMedia('(pointer: coarse)').matches;
+  const shieldBtn = { x: 0, y: 0, r: 44 };
+  function inShieldBtn(px, py) {
+    return isTouch && Math.hypot(px - shieldBtn.x, py - shieldBtn.y) <= shieldBtn.r + 12;
+  }
+
+  let dragId = null, dragLast = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (state === 'playing' && inShieldBtn(e.clientX, e.clientY)) {
+      tryShield();
+      return;
+    }
+    clickToStart();
+    if (state === 'playing') {
+      dragId = e.pointerId;
+      dragLast = { x: e.clientX, y: e.clientY };
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (dragId !== e.pointerId || !dragLast || state !== 'playing') return;
+    const dx = e.clientX - dragLast.x;
+    const dy = e.clientY - dragLast.y;
+    dragLast = { x: e.clientX, y: e.clientY };
+    if (dx || dy) {
+      player.x = Math.max(player.r, Math.min(W - player.r, player.x + dx * 1.25));
+      player.y = Math.max(player.r, Math.min(H - player.r, player.y + dy * 1.25));
+      player.angle = Math.atan2(dy, dx);
+    }
+  });
+  function endDrag(e) {
+    if (dragId === e.pointerId) { dragId = null; dragLast = null; }
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  window.addEventListener('load', () => { canvas.focus(); window.focus(); });
+  // If the window loses focus mid-game, release all held keys so the ship
+  // doesn't keep drifting.
+  window.addEventListener('blur', () => { keys = {}; });
+
+  // ---------- update ----------
+  function update(dt) {
+    if (state !== 'playing') return;
+    elapsed += dt;
+
+    // player movement
+    let mx = 0, my = 0;
+    if (keys['ArrowLeft']) mx -= 1;
+    if (keys['ArrowRight']) mx += 1;
+    if (keys['ArrowUp']) my -= 1;
+    if (keys['ArrowDown']) my += 1;
+    if (mx || my) {
+      const len = Math.hypot(mx, my);
+      player.x += (mx / len) * player.speed * dt;
+      player.y += (my / len) * player.speed * dt;
+      player.angle = Math.atan2(my, mx);
+    }
+    player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+    player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+
+    // spawn obstacles
+    spawnTimer += dt * 1000;
+    if (spawnTimer >= spawnInterval) {
+      spawnTimer = 0;
+      spawnObstacle();
+      // occasionally spawn a second one at higher speeds
+      if (speedMult > 1.6 && Math.random() < 0.35) spawnObstacle();
+      if (speedMult > 2.4 && Math.random() < 0.35) spawnObstacle();
+    }
+
+    const shielded = shieldOn();
+    const margin = 80;
+
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.x += o.vx * dt;
+      o.y += o.vy * dt;
+      o.rot += o.rotSpeed * dt;
+
+      const onScreen = o.x > -o.r && o.x < W + o.r && o.y > -o.r && o.y < H + o.r;
+      if (onScreen) o.entered = true;
+
+      // collision
+      const dist = Math.hypot(o.x - player.x, o.y - player.y);
+      if (dist < o.r + player.r - 3) {
+        if (shielded) {
+          // shield shatters the obstacle, still counts as a dodge
+          burst(o.x, o.y, o.color, 18);
+          obstacles.splice(i, 1);
+          registerDodge();
+          continue;
+        } else {
+          gameOver();
+          return;
+        }
+      }
+
+      // left the play field after entering it = dodged
+      if (o.entered && (o.x < -margin || o.x > W + margin || o.y < -margin || o.y > H + margin)) {
+        obstacles.splice(i, 1);
+        registerDodge();
+      }
+    }
+
+    // particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vx *= 0.96;
+      p.vy *= 0.96;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function registerDodge() {
+    dodged++;
+    score++;
+    // every dodge makes the game a little faster
+    speedMult = 1 + dodged * 0.03;
+    spawnInterval = Math.max(220, 900 - dodged * 12);
+  }
+
+  // ---------- draw ----------
+  function drawGrid() {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 247, 255, 0.06)';
+    ctx.lineWidth = 1;
+    const g = 60;
+    for (let x = 0; x <= W; x += g) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y <= H; y += g) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawStars(t) {
+    ctx.save();
+    for (const s of stars) {
+      const a = 0.25 + 0.25 * Math.sin(t / 700 + s.tw);
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawPoly(x, y, r, sides, rot, color, glow) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = glow;
+    ctx.beginPath();
+    for (let i = 0; i < sides; i++) {
+      const a = (i / sides) * Math.PI * 2;
+      const px = Math.cos(a) * r, py = Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPlayer(t) {
+    const { x, y, r } = player;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(player.angle + Math.PI / 2);
+    ctx.strokeStyle = PLAYER_COLOR;
+    ctx.fillStyle = 'rgba(0, 247, 255, 0.15)';
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = PLAYER_COLOR;
+    ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 1.4);
+    ctx.lineTo(r, r);
+    ctx.lineTo(0, r * 0.5);
+    ctx.lineTo(-r, r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    if (shieldOn()) {
+      const remain = (shieldActiveUntil - performance.now()) / SHIELD_DURATION;
+      const pulse = 1 + 0.06 * Math.sin(t / 90);
+      ctx.save();
+      ctx.strokeStyle = SHIELD_COLOR;
+      ctx.lineWidth = 3;
+      ctx.shadowColor = SHIELD_COLOR;
+      ctx.shadowBlur = 24;
+      ctx.globalAlpha = 0.5 + 0.5 * remain;
+      ctx.beginPath();
+      ctx.arc(x, y, (r + 16) * pulse, 0, Math.PI * 2);
+      ctx.stroke();
+      // shrinking timer arc
+      ctx.beginPath();
+      ctx.arc(x, y, (r + 24) * pulse, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * remain);
+      ctx.globalAlpha = 0.9;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = '#e8fbff';
+    ctx.shadowColor = PLAYER_COLOR;
+    ctx.shadowBlur = 8;
+    ctx.font = 'bold 26px "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('SCORE ' + score, 24, 42);
+    ctx.font = '16px "Courier New", monospace';
+    ctx.fillText('SPEED x' + speedMult.toFixed(2), 24, 68);
+    ctx.fillText('BEST ' + bestScore, 24, 90);
+
+    // shield charges
+    ctx.textAlign = 'right';
+    ctx.font = 'bold 18px "Courier New", monospace';
+    ctx.shadowColor = SHIELD_COLOR;
+    if (shieldOn()) {
+      const secs = Math.max(0, (shieldActiveUntil - performance.now()) / 1000);
+      ctx.fillStyle = SHIELD_COLOR;
+      ctx.fillText('SHIELD ' + secs.toFixed(1) + 's', W - 24, 42);
+    } else {
+      ctx.fillStyle = shieldUses > 0 ? '#e8fbff' : 'rgba(232,251,255,0.35)';
+      ctx.fillText('SHIELD [SPACE]', W - 24, 42);
+    }
+    // charge pips
+    for (let i = 0; i < SHIELD_MAX_USES; i++) {
+      const cx = W - 24 - i * 26;
+      ctx.beginPath();
+      ctx.arc(cx - 8, 62, 8, 0, Math.PI * 2);
+      if (i < shieldUses) {
+        ctx.fillStyle = SHIELD_COLOR;
+        ctx.shadowBlur = 12;
+        ctx.fill();
+      } else {
+        ctx.strokeStyle = 'rgba(123,92,255,0.4)';
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
+
+    // on-screen shield button for touch devices
+    if (isTouch) {
+      shieldBtn.x = W - 78;
+      shieldBtn.y = H - 96;
+      const active = shieldOn();
+      const usable = shieldUses > 0 && !active;
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.arc(shieldBtn.x, shieldBtn.y, shieldBtn.r, 0, Math.PI * 2);
+      ctx.fillStyle = active ? 'rgba(123,92,255,0.35)'
+                    : usable ? 'rgba(123,92,255,0.18)'
+                    : 'rgba(123,92,255,0.06)';
+      ctx.fill();
+      ctx.strokeStyle = usable || active ? SHIELD_COLOR : 'rgba(123,92,255,0.3)';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = SHIELD_COLOR;
+      ctx.shadowBlur = usable || active ? 16 : 0;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = usable || active ? '#e8fbff' : 'rgba(232,251,255,0.35)';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 14px "Courier New", monospace';
+      if (active) {
+        const secs = Math.max(0, (shieldActiveUntil - performance.now()) / 1000);
+        ctx.fillText(secs.toFixed(1) + 's', shieldBtn.x, shieldBtn.y + 5);
+      } else {
+        ctx.fillText('SHIELD', shieldBtn.x, shieldBtn.y);
+        ctx.fillText('x' + shieldUses, shieldBtn.x, shieldBtn.y + 18);
+      }
+    }
+    ctx.restore();
+  }
+
+  function centerText(lines, t) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    let y = H / 2 - (lines.length * 40) / 2;
+    for (const line of lines) {
+      ctx.font = line.font;
+      ctx.fillStyle = line.color;
+      ctx.shadowColor = line.glow || line.color;
+      ctx.shadowBlur = 16;
+      if (line.blink && Math.floor(t / 500) % 2 === 0) { y += line.gap || 46; continue; }
+      ctx.fillText(line.text, W / 2, y);
+      y += line.gap || 46;
+    }
+    ctx.restore();
+  }
+
+  function draw(t) {
+    ctx.clearRect(0, 0, W, H);
+    drawGrid();
+    drawStars(t);
+
+    for (const p of particles) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 10;
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+      ctx.restore();
+    }
+
+    if (state === 'start') {
+      centerText([
+        { text: 'N E O N   D O D G E', font: 'bold 54px "Courier New", monospace', color: PLAYER_COLOR, gap: 70 },
+        { text: isTouch ? 'DRAG your finger to move. Dodge everything.' : 'ARROW KEYS to move. Dodge everything.', font: '20px "Courier New", monospace', color: '#e8fbff' },
+        { text: isTouch ? 'Tap SHIELD button (5 seconds, only 2 per run)' : 'SPACE = shield (5 seconds, only 2 per run)', font: '20px "Courier New", monospace', color: SHIELD_COLOR },
+        { text: 'Every dodge = 1 point. It only gets faster.', font: '20px "Courier New", monospace', color: '#ff2fd6', gap: 60 },
+        { text: isTouch ? 'TAP TO START' : 'CLICK HERE OR PRESS ANY ARROW KEY TO START', font: 'bold 24px "Courier New", monospace', color: '#a6ff00', blink: true },
+        { text: bestScore > 0 ? 'BEST: ' + bestScore : '', font: '18px "Courier New", monospace', color: '#e8fbff' }
+      ], t);
+    } else if (state === 'playing') {
+      for (const o of obstacles) drawPoly(o.x, o.y, o.r, o.sides, o.rot, o.color, 14);
+      drawPlayer(t);
+      drawHUD();
+    } else if (state === 'gameover') {
+      for (const o of obstacles) drawPoly(o.x, o.y, o.r, o.sides, o.rot, o.color, 10);
+      centerText([
+        { text: 'GAME OVER', font: 'bold 60px "Courier New", monospace', color: '#ff3355', gap: 70 },
+        { text: 'SCORE: ' + score, font: 'bold 30px "Courier New", monospace', color: '#e8fbff' },
+        { text: 'BEST: ' + bestScore + (score >= bestScore && score > 0 ? '  << NEW BEST!' : ''), font: '22px "Courier New", monospace', color: '#ffb300', gap: 64 },
+        { text: isTouch ? 'TAP TO PLAY AGAIN' : 'CLICK OR PRESS ENTER TO PLAY AGAIN', font: 'bold 22px "Courier New", monospace', color: '#a6ff00', blink: true }
+      ], t);
+      drawHUD();
+    }
+  }
+
+  function loop(t) {
+    const dt = Math.min(0.05, (t - lastTime) / 1000 || 0);
+    lastTime = t;
+    update(dt);
+    draw(t);
+    requestAnimationFrame(loop);
+  }
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
